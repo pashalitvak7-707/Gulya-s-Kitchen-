@@ -1335,7 +1335,34 @@
 </footer>
 
 <script>
-const MENU_DATA = [
+// =========================================================
+// MENU DATA
+//
+// The menu is fetched live from a published Google Sheet on every page load.
+// If that fetch fails (offline, sheet unpublished, Google down, etc.), the
+// hardcoded FALLBACK_MENU_DATA below is used so the page never shows a
+// broken menu. To change the live menu, edit the Google Sheet — not this file.
+//
+// Sheet URL: gulya-menu (published as CSV)
+// Columns: category, category_ru, name, name_ru, price, meta, meta_ru, active
+// =========================================================
+const MENU_SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRBn6rXJvY5RAehmp9eaDQdHlQWpMcUIKmwzYq12B_Jo3WWYIN46gtaTalR_9c1DvDMqG_W2NepW1cV/pub?gid=0&single=true&output=csv";
+
+// Maps category name to display subtitle + URL-safe id. Add a new entry here
+// only if you create a brand-new category in the sheet that wasn't there before.
+const CATEGORY_META = {
+  "Soups":                    { id: "cat-soups",    subtitle: "Slow-simmered, soul-warming",   subtitle_ru: "Долго томлёные, согревающие душу" },
+  "Salads":                   { id: "cat-salads",   subtitle: "Fresh, classic, generous",      subtitle_ru: "Свежие, классические, щедрые" },
+  "Starters & Pastries":      { id: "cat-starters", subtitle: "Small bites with big flavour",  subtitle_ru: "Маленькие, но яркие" },
+  "Mains & Pilaf":            { id: "cat-mains",    subtitle: "The heart of the menu",         subtitle_ru: "Сердце нашего меню" },
+  "Dumplings & Dough Dishes": { id: "cat-dough",    subtitle: "Hand-folded, always",           subtitle_ru: "Всегда ручной лепки" },
+  "Crepes & Breakfast":       { id: "cat-crepes",   subtitle: "Light, golden, comforting",     subtitle_ru: "Лёгкие, золотистые, уютные" },
+  "Desserts & Sweet Things":  { id: "cat-desserts", subtitle: "End at home",                   subtitle_ru: "Завершите дома" },
+};
+
+let MENU_DATA = []; // populated either from sheet or fallback at startup
+
+const FALLBACK_MENU_DATA = [
   {
     id: "cat-soups",
     name: "Soups",
@@ -1453,6 +1480,124 @@ const MENU_DATA = [
     ]
   }
 ];
+
+// Start with the fallback data so the page can render instantly.
+// The live sheet fetch will replace this asynchronously.
+MENU_DATA = FALLBACK_MENU_DATA;
+
+// ===== CSV parser =====
+// Handles quoted fields, embedded commas, embedded quotes (""),
+// and both LF and CRLF line endings. Returns array of arrays.
+function parseCSV(text) {
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else {
+        field += c;
+      }
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ',') { row.push(field); field = ''; }
+      else if (c === '\n' || c === '\r') {
+        if (c === '\r' && text[i + 1] === '\n') i++;
+        row.push(field); field = '';
+        if (row.length > 1 || row[0] !== '') rows.push(row);
+        row = [];
+      } else {
+        field += c;
+      }
+    }
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+// Turn the raw CSV rows into the MENU_DATA shape the rest of the code expects.
+function csvToMenuData(rows) {
+  if (rows.length < 2) return null;
+  // Strip BOM if present on the first header cell
+  rows[0][0] = rows[0][0].replace(/^\uFEFF/, '');
+  const headers = rows[0].map(h => h.trim());
+  const idx = (name) => headers.indexOf(name);
+
+  const iCat   = idx('category');
+  const iCatRu = idx('category_ru');
+  const iName  = idx('name');
+  const iNameRu = idx('name_ru');
+  const iPrice = idx('price');
+  const iMeta  = idx('meta');
+  const iMetaRu = idx('meta_ru');
+  const iActive = idx('active');
+
+  if (iCat < 0 || iName < 0 || iPrice < 0) {
+    console.warn('Menu CSV missing required columns (category, name, price)');
+    return null;
+  }
+
+  const byCategory = new Map();   // preserves insertion order
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r];
+    if (!row || row.every(c => !c || !c.trim())) continue; // blank line
+    const active = iActive >= 0 ? (row[iActive] || '').trim().toLowerCase() : 'yes';
+    if (active && active !== 'yes' && active !== 'true' && active !== '1') continue;
+
+    const catName = (row[iCat] || '').trim();
+    if (!catName) continue;
+
+    if (!byCategory.has(catName)) {
+      const fallback = FALLBACK_MENU_DATA.find(c => c.name === catName);
+      const meta = CATEGORY_META[catName] || (fallback ? { id: fallback.id, subtitle: fallback.subtitle, subtitle_ru: fallback.subtitle_ru } : { id: 'cat-' + catName.toLowerCase().replace(/[^a-z0-9]+/g, '-'), subtitle: '', subtitle_ru: '' });
+      byCategory.set(catName, {
+        id: meta.id,
+        name: catName,
+        name_ru: (iCatRu >= 0 ? (row[iCatRu] || '').trim() : '') || catName,
+        subtitle: meta.subtitle,
+        subtitle_ru: meta.subtitle_ru,
+        items: [],
+      });
+    }
+
+    const item = {
+      name:    (row[iName]  || '').trim(),
+      price:   (row[iPrice] || '').trim(),
+    };
+    if (iNameRu >= 0 && row[iNameRu]) item.name_ru = row[iNameRu].trim();
+    if (iMeta   >= 0 && row[iMeta])   item.meta    = row[iMeta].trim();
+    if (iMetaRu >= 0 && row[iMetaRu]) item.meta_ru = row[iMetaRu].trim();
+
+    if (item.name && item.price) byCategory.get(catName).items.push(item);
+  }
+
+  const result = Array.from(byCategory.values()).filter(c => c.items.length > 0);
+  return result.length ? result : null;
+}
+
+// Fetch the live menu in the background, then re-render if it loaded.
+async function loadLiveMenu() {
+  try {
+    const url = MENU_SHEET_URL + (MENU_SHEET_URL.includes('?') ? '&' : '?') + 'cachebust=' + Date.now();
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const text = await res.text();
+    const rows = parseCSV(text);
+    const data = csvToMenuData(rows);
+    if (data) {
+      MENU_DATA = data;
+      renderMenu();
+    } else {
+      console.warn('Live menu parse returned empty — keeping fallback.');
+    }
+  } catch (err) {
+    console.warn('Live menu fetch failed — keeping fallback.', err);
+  }
+}
 
 // ===== Lightbox =====
 (function setupLightbox() {
@@ -1615,6 +1760,10 @@ document.querySelectorAll('.fade-in').forEach(el => fadeObserver.observe(el));
 
 renderMenu();
 document.getElementById('year').textContent = new Date().getFullYear();
+
+// Kick off the live-menu fetch in the background — replaces the fallback
+// once Google's CSV comes back.
+loadLiveMenu();
 
 // Restore preferred language if previously set
 try {
